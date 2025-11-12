@@ -130,7 +130,6 @@ Authorization: Bearer <ACCESS>
 Додати is_public/visibility, пагінацію, сортування.
 
 Розділити доступи (ролі), refresh endpoint.
-
 Валідація довжин/обмежень, індекси по title, tags.
 
 Centralized logging (JSON) + OpenTelemetry.
