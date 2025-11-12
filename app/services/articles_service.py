@@ -70,10 +70,12 @@ class ArticlesService:
 
     async def analyze(self, article_id: str, requester_id: str) -> dict:
         doc = await self.repo.get_by_id(article_id)
+
         if not doc:
             raise HTTPException(status_code=404, detail="Article not found")
-        # правило доступу: тільки автор може запускати аналіз
+
         if str(doc.get("author")) != requester_id:
             raise HTTPException(status_code=403, detail="Only author can analyze")
         task_id = await self.analyzer.enqueue(article_id) if self.analyzer else None
+
         return {"status": "scheduled", "task_id": task_id}

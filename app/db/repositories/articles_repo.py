@@ -10,17 +10,15 @@ from app.models import ARTICLES_COL
 
 
 class ArticlesRepo:
-    """DAO для колекції articles."""
 
     def __init__(self, db):
         self.col = db[ARTICLES_COL]
 
-    # ---- індекси (виклич один раз на старті або ліниво) ---------------------
     async def ensure_indexes(self) -> None:
         await self.col.create_index([("author", 1)])
         await self.col.create_index([("created_at", -1)])
         await self.col.create_index([("tags", 1)])
-        # текстовий індекс для пошуку
+
         await self.col.create_index([("title", "text"), ("content", "text")])
 
     # ---- CRUD ----------------------------------------------------------------
@@ -51,7 +49,6 @@ class ArticlesRepo:
         res = await self.col.delete_one({"_id": ObjectId(article_id)})
         return res.deleted_count == 1
 
-    # ---- вибірка -------------------------------------------------------------
     async def list(
         self,
         *,
@@ -79,7 +76,6 @@ class ArticlesRepo:
         return items, total
 
     async def set_analysis(self, article_id: str, analysis: dict) -> bool:
-        """Оновити поле analysis у статті."""
         res = await self.col.update_one(
             {"_id": ObjectId(article_id)},
             {"$set": {"analysis": analysis, "updated_at": datetime.now(timezone.utc)}},
