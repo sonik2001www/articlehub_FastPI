@@ -1,0 +1,26 @@
+docker build --no-cache -t articlehub .
+rкоманда якою збілдив
+
+docker compose up --build
+наступний запуск
+
+
+ЯК ЗАЛІЗТИ В МОНГО
+docker ps
+всі запущені контейнери щоб побачити назву монго
+
+docker exec -it articlehub-mongo-1 mongosh
+перейти в термінал
+
+
+show dbs
+всі бд
+
+use articlehub
+перейти в конкретну бд
+
+db.users.find()
+db.emails_log.find()
+переглянути рядки колекції
+
+

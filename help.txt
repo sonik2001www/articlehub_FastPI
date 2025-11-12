@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+### 0) БАЗОВІ ЗМІННІ (підстав свої за потреби)
+#   Використовуються далі у всіх командах.
+export AWS_REGION=us-east-1
+export AWS_ACCOUNT_ID=653999527800
+export ECR_REPO_NAME=articlehub-new
+export CLUSTER=articlehub-new-cluster
+export SERVICE=articlehub-new-svc
+export TASK_FAMILY=articlehub-new-task
+export LOG_GROUP=/ecs/articlehub
+
+### 1) СТВОРИТИ/ПЕРЕВІРИТИ ECR РЕПО
+#   Якщо репо не існує — створюємо; інакше пропускаємо.
+aws ecr describe-repositories --repository-names ${ECR_REPO_NAME} --region ${AWS_REGION} >/dev/null 2>&1 \
+  || aws ecr create-repository --repository-name ${ECR_REPO_NAME} --region ${AWS_REGION}
+
+### 2) ЛОГІН У ECR
+#   Щоб пушити образи в репозиторій.
+aws ecr get-login-password --region ${AWS_REGION} \
+  | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+
+### 3) ЗІБРАТИ І ПУШНУТИ ARM64 ОБРАЗ (ГАРАНТОВАНО БЕЗ exec format error)
+#   Будуємо під linux/arm64 (або multi-arch) і пушимо новий тег.
+export IMAGE_TAG_ARM64=$(date +%Y%m%d-%H%M%S)-arm64
+docker buildx create --use 2>/dev/null || true
+docker buildx build --platform linux/arm64 \
+  -t ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}:${IMAGE_TAG_ARM64} \
+  --push .
+
+### 4) CLOUDWATCH LOG GROUP
+#   Разово створюємо групу логів для контейнерів.
+aws logs create-log-group --log-group-name ${LOG_GROUP} --region ${AWS_REGION} 2>/dev/null || true
+
+### 5) СТВОРИТИ КЛАСТЕР ECS
+#   Якщо кластер вже є — команда нічого не зламає.
+aws ecs create-cluster --cluster-name ${CLUSTER} --region ${AWS_REGION} >/dev/null || true
+
+### 6) РОЛЬ ВИКОНАННЯ ДЛЯ ТАСКА (ecsTaskExecutionRole)
+#   Дає права тягнути образи з ECR і писати логи в CloudWatch.
+aws iam get-role --role-name ecsTaskExecutionRole >/dev/null 2>&1 || \
+aws iam create-role --role-name ecsTaskExecutionRole \
+  --assume-role-policy-document '{
+    "Version":"2012-10-17",
+    "Statement":[{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]
+  }'
+aws iam attach-role-policy --role-name ecsTaskExecutionRole \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+### 7) СЕКРЕТИ В SSM PARAMETER STORE
+#   Кладемо JWT секрет і пароль пошти як SecureString. Потім ECS підніме їх як env через `secrets`.
+export PARAM_JWT=/articlehub/JWT_SECRET
+export PARAM_SMTP=/articlehub/SMTP_PASSWORD
+export JWT_SECRET_VALUE=$(openssl rand -hex 64)     # довгий рандомний секрет
+# !!! ПІДСТАВ СВІЙ APP PASSWORD В SMTP_APP_PASSWORD !!!
+export SMTP_APP_PASSWORD="ВАШ_GMAIL_APP_PASSWORD"
+
+aws ssm put-parameter --name "$PARAM_JWT"  --value "$JWT_SECRET_VALUE"  --type SecureString --overwrite --region $AWS_REGION
+aws ssm put-parameter --name "$PARAM_SMTP" --value "$SMTP_APP_PASSWORD" --type SecureString --overwrite --region $AWS_REGION
+
+### 8) ДОЗВІЛ ecsTaskExecutionRole НА ЧИТАННЯ SSM ПАРАМЕТРІВ
+#   Щоб таск міг підтягнути секрети з Parameter Store.
+aws iam put-role-policy \
+  --role-name ecsTaskExecutionRole \
+  --policy-name AllowSSMParamsForArticleHub \
+  --policy-document '{
+    "Version":"2012-10-17",
+    "Statement":[{"Effect":"Allow","Action":["ssm:GetParameter","ssm:GetParameters","ssm:GetParametersByPath"],"Resource":["arn:aws:ssm:'"$AWS_REGION"':'"$AWS_ACCOUNT_ID"':parameter/articlehub/*"]}]
+  }'
+
+### 9) СТВОРИТИ БЕЗПЕКОВУ ГРУПУ SG (PORT 8000 ДЛЯ API)
+#   SG відкриває inbound :8000 з інтернету (для тесту) і дозволяє egress :443 (SSM/ECR).
+export SG_NAME=articlehub-new-sg
+export VPC_ID=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query "Vpcs[0].VpcId" --output text --region ${AWS_REGION})
+export SG_ID=$(aws ec2 create-security-group --group-name ${SG_NAME} --description "ArticleHub test SG" --vpc-id ${VPC_ID} --query GroupId --output text --region ${AWS_REGION} 2>/dev/null || true \
+  && aws ec2 describe-security-groups --filters "Name=group-name,Values=${SG_NAME}" --region ${AWS_REGION} --query "SecurityGroups[0].GroupId" --output text)
+aws ec2 authorize-security-group-ingress --group-id ${SG_ID} --protocol tcp --port 8000 --cidr 0.0.0.0/0 --region ${AWS_REGION} 2>/dev/null || true
+aws ec2 authorize-security-group-egress  --group-id ${SG_ID} --protocol tcp --port 443  --cidr 0.0.0.0/0 --region ${AWS_REGION} 2>/dev/null || true
+
+### 10) ОБРАТИ ПУБЛІЧНІ САБНЕТИ (З МАРШРУТОМ НА IGW)
+#    Потрібні для доступу в інтернет (SSM/ECR) і публічної IP.
+SUBNETS=($(aws ec2 describe-subnets --filters "Name=vpc-id,Values=${VPC_ID}" --query "Subnets[].SubnetId" --output text --region ${AWS_REGION}))
+PUBLIC_SUBNETS=()
+for s in "${SUBNETS[@]}"; do
+  IGW_ROUTE=$(aws ec2 describe-route-tables --filters "Name=association.subnet-id,Values=${s}" --region ${AWS_REGION} \
+    --query "RouteTables[].Routes[?DestinationCidrBlock=='0.0.0.0/0' && GatewayId!=null].GatewayId" --output text)
+  [[ "$IGW_ROUTE" == igw-* ]] && PUBLIC_SUBNETS+=("$s")
+done
+# Якщо треба, зафіксуй руками (підстав свої знайдені IDs):
+SUBNET1=${PUBLIC_SUBNETS[0]}
+SUBNET2=${PUBLIC_SUBNETS[1]}
+
+### 11) TASK DEFINITION ФАЙЛ (ARM64 + SECRETS З SSM)
+#    Генеруємо TD з правильним образом, ARM64 і secrets; логування в /ecs/articlehub.
+cat > task-def-articlehub.json <<JSON
+{
+  "family": "${TASK_FAMILY}",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "runtimePlatform": { "cpuArchitecture": "ARM64", "operatingSystemFamily": "LINUX" },
+  "cpu": "1024",
+  "memory": "2048",
+  "executionRoleArn": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/ecsTaskExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "api",
+      "image": "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}:${IMAGE_TAG_ARM64}",
+      "essential": true,
+      "portMappings": [{ "containerPort": 8000, "protocol": "tcp" }],
+      "environment": [
+        { "name": "APP_NAME", "value": "ArticleHub" },
+        { "name": "APP_ENV", "value": "prod" },
+        { "name": "APP_DEBUG", "value": "false" },
+        { "name": "APP_HOST", "value": "0.0.0.0" },
+        { "name": "APP_PORT", "value": "8000" },
+
+        { "name": "MONGO_URI", "value": "mongodb://127.0.0.1:27017" },
+        { "name": "MONGO_DB", "value": "articlehub" },
+
+        { "name": "JWT_ALG", "value": "HS256" },
+        { "name": "ACCESS_TOKEN_EXPIRE_MINUTES", "value": "60" },
+        { "name": "REFRESH_TOKEN_EXPIRE_DAYS", "value": "7" },
+
+        { "name": "REDIS_BROKER_URL", "value": "redis://127.0.0.1:6379/0" },
+        { "name": "REDIS_RESULT_BACKEND", "value": "redis://127.0.0.1:6379/1" },
+
+        { "name": "SMTP_HOST", "value": "smtp.gmail.com" },
+        { "name": "SMTP_PORT", "value": "587" },
+        { "name": "SMTP_USER", "value": "sonik2001www@gmail.com" }
+      ],
+      "secrets": [
+        { "name": "JWT_SECRET", "valueFrom": "arn:aws:ssm:${AWS_REGION}:${AWS_ACCOUNT_ID}:parameter/articlehub/JWT_SECRET" },
+        { "name": "SMTP_PASSWORD", "valueFrom": "arn:aws:ssm:${AWS_REGION}:${AWS_ACCOUNT_ID}:parameter/articlehub/SMTP_PASSWORD" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": { "awslogs-group": "${LOG_GROUP}", "awslogs-region": "${AWS_REGION}", "awslogs-stream-prefix": "api" }
+      },
+      "dependsOn": [
+        { "containerName": "mongo", "condition": "START" },
+        { "containerName": "redis", "condition": "START" }
+      ]
+    },
+    {
+      "name": "worker",
+      "image": "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}:${IMAGE_TAG_ARM64}",
+      "essential": true,
+      "command": ["celery", "-A", "app.workers.celery_app.celery_app", "worker", "-Q", "emails,stats,analysis", "--loglevel=INFO"],
+      "environment": [
+        { "name": "MONGO_URI", "value": "mongodb://127.0.0.1:27017" },
+        { "name": "MONGO_DB", "value": "articlehub" },
+        { "name": "JWT_ALG", "value": "HS256" },
+        { "name": "REDIS_BROKER_URL", "value": "redis://127.0.0.1:6379/0" },
+        { "name": "REDIS_RESULT_BACKEND", "value": "redis://127.0.0.1:6379/1" },
+        { "name": "SMTP_HOST", "value": "smtp.gmail.com" },
+        { "name": "SMTP_PORT", "value": "587" },
+        { "name": "SMTP_USER", "value": "sonik2001www@gmail.com" }
+      ],
+      "secrets": [
+        { "name": "JWT_SECRET", "valueFrom": "arn:aws:ssm:${AWS_REGION}:${AWS_ACCOUNT_ID}:parameter/articlehub/JWT_SECRET" },
+        { "name": "SMTP_PASSWORD", "valueFrom": "arn:aws:ssm:${AWS_REGION}:${AWS_ACCOUNT_ID}:parameter/articlehub/SMTP_PASSWORD" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": { "awslogs-group": "${LOG_GROUP}", "awslogs-region": "${AWS_REGION}", "awslogs-stream-prefix": "worker" }
+      },
+      "dependsOn": [
+        { "containerName": "mongo", "condition": "START" },
+        { "containerName": "redis", "condition": "START" }
+      ]
+    },
+    {
+      "name": "beat",
+      "image": "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}:${IMAGE_TAG_ARM64}",
+      "essential": false,
+      "command": ["celery", "-A", "app.workers.celery_app.celery_app", "beat", "--loglevel=INFO"],
+      "environment": [
+        { "name": "MONGO_URI", "value": "mongodb://127.0.0.1:27017" },
+        { "name": "MONGO_DB", "value": "articlehub" },
+        { "name": "JWT_ALG", "value": "HS256" },
+        { "name": "REDIS_BROKER_URL", "value": "redis://127.0.0.1:6379/0" },
+        { "name": "REDIS_RESULT_BACKEND", "value": "redis://127.0.0.1:6379/1" },
+        { "name": "SMTP_HOST", "value": "smtp.gmail.com" },
+        { "name": "SMTP_PORT", "value": "587" },
+        { "name": "SMTP_USER", "value": "sonik2001www@gmail.com" }
+      ],
+      "secrets": [
+        { "name": "JWT_SECRET", "valueFrom": "arn:aws:ssm:${AWS_REGION}:${AWS_ACCOUNT_ID}:parameter/articlehub/JWT_SECRET" },
+        { "name": "SMTP_PASSWORD", "valueFrom": "arn:aws:ssm:${AWS_REGION}:${AWS_ACCOUNT_ID}:parameter/articlehub/SMTP_PASSWORD" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": { "awslogs-group": "${LOG_GROUP}", "awslogs-region": "${AWS_REGION}", "awslogs-stream-prefix": "beat" }
+      },
+      "dependsOn": [
+        { "containerName": "mongo", "condition": "START" },
+        { "containerName": "redis", "condition": "START" }
+      ]
+    },
+    {
+      "name": "mongo",
+      "image": "mongo:7",
+      "essential": true,
+      "portMappings": [{ "containerPort": 27017, "protocol": "tcp" }],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": { "awslogs-group": "${LOG_GROUP}", "awslogs-region": "${AWS_REGION}", "awslogs-stream-prefix": "mongo" }
+      }
+    },
+    {
+      "name": "redis",
+      "image": "redis:7",
+      "essential": true,
+      "portMappings": [{ "containerPort": 6379, "protocol": "tcp" }],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": { "awslogs-group": "${LOG_GROUP}", "awslogs-region": "${AWS_REGION}", "awslogs-stream-prefix": "redis" }
+      }
+    }
+  ]
+}
+JSON
+
+### 12) РЕЄСТРАЦІЯ TASK DEFINITION
+#    Створюємо ревізію TD.
+aws ecs register-task-definition --cli-input-json file://task-def-articlehub.json --region ${AWS_REGION}
+
+### 13) СТВОРЕННЯ СЕРВІСУ (FARGATE, PUBLIC IP)
+#    Запускаємо сервіс на двох публічних субнетах із публічною IP.
+aws ecs create-service \
+  --cluster ${CLUSTER} \
+  --service-name ${SERVICE} \
+  --task-definition ${TASK_FAMILY} \
+  --desired-count 1 \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[\"${SUBNET1}\",\"${SUBNET2}\"],securityGroups=[\"${SG_ID}\"],assignPublicIp=ENABLED}" \
+  --region ${AWS_REGION} >/dev/null 2>&1 || \
+aws ecs update-service \
+  --cluster ${CLUSTER} \
+  --service ${SERVICE} \
+  --task-definition ${TASK_FAMILY} \
+  --network-configuration "awsvpcConfiguration={subnets=[\"${SUBNET1}\",\"${SUBNET2}\"],securityGroups=[\"${SG_ID}\"],assignPublicIp=ENABLED}" \
+  --force-new-deployment \
+  --region ${AWS_REGION}
+
+### 14) ПЕРЕВІРИТИ СТАН СЕРВІСУ
+#    Має стати runningCount=1.
+aws ecs describe-services \
+  --cluster ${CLUSTER} \
+  --services ${SERVICE} \
+  --region ${AWS_REGION} \
+  --query 'services[0].{desired:desiredCount,running:runningCount,pending:pendingCount,status:status}'
+
+### 15) ВИТЯГНУТИ ПУБЛІЧНУ IP ТА ПЕРЕВІРИТИ API
+#    Відкрий http://PUBLIC_IP:8000/docs у браузері.
+TASK_ARN=$(aws ecs list-tasks --cluster ${CLUSTER} --service-name ${SERVICE} --region ${AWS_REGION} --query 'taskArns[0]' --output text)
+ENI_ID=$(aws ecs describe-tasks --cluster ${CLUSTER} --tasks "$TASK_ARN" --region ${AWS_REGION} --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' --output text)
+PUBLIC_IP=$(aws ec2 describe-network-interfaces --network-interface-ids "$ENI_ID" --region ${AWS_REGION} --query 'NetworkInterfaces[0].Association.PublicIp' --output text)
+echo "Open: http://${PUBLIC_IP}:8000/docs"
+
+### 16) ТЯГНУТИ ЛОГИ ВСІЄЇ ГРУПИ
+#    Потокове читання логів з усіх контейнерів.
+aws logs tail ${LOG_GROUP} --since 30m --follow --region ${AWS_REGION}
+
+### 17) ДЕПЛОЙ НОВОГО ОБРАЗУ В МАЙБУТНЬОМУ (ШВИДКИЙ ЦИКЛ)
+#    Зібрати новий ARM64 тег, оновити TD і форснути деплой.
+#    (використовуй знову кроки 3, 12, 13/force-new-deployment).

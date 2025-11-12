@@ -1,0 +1,76 @@
+# -------------------------
+# Python
+# -------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+*.egg-info/
+*.egg
+dist/
+build/
+
+# -------------------------
+# Environment
+# -------------------------
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# -------------------------
+# Logs
+# -------------------------
+*.log
+logs/
+uvicorn.log
+
+# -------------------------
+# IDE / OS
+# -------------------------
+.DS_Store
+.idea/
+.vscode/
+*.iml
+
+# -------------------------
+# Byte-compiled / cache
+# -------------------------
+.pytest_cache/
+.mypy_cache/
+pytestdebug.log
+
+# -------------------------
+# Databases (якщо SQLite)
+# -------------------------
+*.sqlite3
+db.sqlite3
+
+# -------------------------
+# Static / Media (якщо використовуєш)
+# -------------------------
+static/
+media/
+
+# -------------------------
+# Docker
+# -------------------------
+docker-compose.override.yml
+.secrets/
+*.pem
+
+# -------------------------
+# Coverage / Testing
+# -------------------------
+.coverage
+coverage.xml
+htmlcov/
+
+# -------------------------
+# Local development
+# -------------------------
+*.local
+

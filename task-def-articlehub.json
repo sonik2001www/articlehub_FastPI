@@ -1,0 +1,161 @@
+{
+  "family": "articlehub-new-task",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "runtimePlatform": {
+      "cpuArchitecture": "ARM64",
+      "operatingSystemFamily": "LINUX"
+    },
+  "cpu": "1024",
+  "memory": "2048",
+  "executionRoleArn": "arn:aws:iam::653999527800:role/ecsTaskExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "api",
+      "image": "653999527800.dkr.ecr.us-east-1.amazonaws.com/articlehub-new:20251111-170108-arm64",
+      "essential": true,
+      "portMappings": [
+        { "containerPort": 8000, "protocol": "tcp" }
+      ],
+      "environment": [
+        { "name": "APP_NAME", "value": "ArticleHub" },
+        { "name": "APP_ENV", "value": "prod" },
+        { "name": "APP_DEBUG", "value": "false" },
+        { "name": "APP_HOST", "value": "0.0.0.0" },
+        { "name": "APP_PORT", "value": "8000" },
+
+        { "name": "MONGO_URI", "value": "mongodb://127.0.0.1:27017" },
+        { "name": "MONGO_DB", "value": "articlehub" },
+
+        { "name": "JWT_ALG", "value": "HS256" },
+        { "name": "ACCESS_TOKEN_EXPIRE_MINUTES", "value": "60" },
+        { "name": "REFRESH_TOKEN_EXPIRE_DAYS", "value": "7" },
+
+        { "name": "REDIS_BROKER_URL", "value": "redis://127.0.0.1:6379/0" },
+        { "name": "REDIS_RESULT_BACKEND", "value": "redis://127.0.0.1:6379/1" },
+
+        { "name": "SMTP_HOST", "value": "smtp.gmail.com" },
+        { "name": "SMTP_PORT", "value": "587" },
+        { "name": "SMTP_USER", "value": "sonik2001www@gmail.com" }
+      ],
+      "secrets": [
+        { "name": "JWT_SECRET", "valueFrom": "arn:aws:ssm:us-east-1:653999527800:parameter/articlehub/JWT_SECRET" },
+        { "name": "SMTP_PASSWORD", "valueFrom": "arn:aws:ssm:us-east-1:653999527800:parameter/articlehub/SMTP_PASSWORD" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/articlehub",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "api"
+        }
+      },
+      "dependsOn": [
+        { "containerName": "mongo", "condition": "START" },
+        { "containerName": "redis", "condition": "START" }
+      ]
+    },
+    {
+      "name": "worker",
+      "image": "653999527800.dkr.ecr.us-east-1.amazonaws.com/articlehub-new:20251111-170108-arm64",
+      "essential": true,
+      "command": ["celery", "-A", "app.workers.celery_app.celery_app", "worker", "-Q", "emails,stats,analysis", "--loglevel=INFO"],
+      "environment": [
+        { "name": "MONGO_URI", "value": "mongodb://127.0.0.1:27017" },
+        { "name": "MONGO_DB", "value": "articlehub" },
+
+        { "name": "JWT_ALG", "value": "HS256" },
+
+        { "name": "REDIS_BROKER_URL", "value": "redis://127.0.0.1:6379/0" },
+        { "name": "REDIS_RESULT_BACKEND", "value": "redis://127.0.0.1:6379/1" },
+
+        { "name": "SMTP_HOST", "value": "smtp.gmail.com" },
+        { "name": "SMTP_PORT", "value": "587" },
+        { "name": "SMTP_USER", "value": "sonik2001www@gmail.com" }
+      ],
+      "secrets": [
+        { "name": "JWT_SECRET", "valueFrom": "arn:aws:ssm:us-east-1:653999527800:parameter/articlehub/JWT_SECRET" },
+        { "name": "SMTP_PASSWORD", "valueFrom": "arn:aws:ssm:us-east-1:653999527800:parameter/articlehub/SMTP_PASSWORD" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/articlehub",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "worker"
+        }
+      },
+      "dependsOn": [
+        { "containerName": "mongo", "condition": "START" },
+        { "containerName": "redis", "condition": "START" }
+      ]
+    },
+    {
+      "name": "beat",
+      "image": "653999527800.dkr.ecr.us-east-1.amazonaws.com/articlehub-new:20251111-170108-arm64",
+      "essential": false,
+      "command": ["celery", "-A", "app.workers.celery_app.celery_app", "beat", "--loglevel=INFO"],
+      "environment": [
+        { "name": "MONGO_URI", "value": "mongodb://127.0.0.1:27017" },
+        { "name": "MONGO_DB", "value": "articlehub" },
+
+        { "name": "JWT_ALG", "value": "HS256" },
+
+        { "name": "REDIS_BROKER_URL", "value": "redis://127.0.0.1:6379/0" },
+        { "name": "REDIS_RESULT_BACKEND", "value": "redis://127.0.0.1:6379/1" },
+
+        { "name": "SMTP_HOST", "value": "smtp.gmail.com" },
+        { "name": "SMTP_PORT", "value": "587" },
+        { "name": "SMTP_USER", "value": "sonik2001www@gmail.com" }
+      ],
+      "secrets": [
+        { "name": "JWT_SECRET", "valueFrom": "arn:aws:ssm:us-east-1:653999527800:parameter/articlehub/JWT_SECRET" },
+        { "name": "SMTP_PASSWORD", "valueFrom": "arn:aws:ssm:us-east-1:653999527800:parameter/articlehub/SMTP_PASSWORD" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/articlehub",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "beat"
+        }
+      },
+      "dependsOn": [
+        { "containerName": "mongo", "condition": "START" },
+        { "containerName": "redis", "condition": "START" }
+      ]
+    },
+    {
+      "name": "mongo",
+      "image": "mongo:7",
+      "essential": true,
+      "portMappings": [
+        { "containerPort": 27017, "protocol": "tcp" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/articlehub",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "mongo"
+        }
+      }
+    },
+    {
+      "name": "redis",
+      "image": "redis:7",
+      "essential": true,
+      "portMappings": [
+        { "containerPort": 6379, "protocol": "tcp" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/articlehub",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "redis"
+        }
+      }
+    }
+  ]
+}

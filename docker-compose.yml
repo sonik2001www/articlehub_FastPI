@@ -1,0 +1,48 @@
+services:
+  api:
+    build: .
+    image: articlehub:latest
+    env_file: .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      - mongo
+      - redis
+    restart: unless-stopped
+
+  worker:
+    build: .
+    image: articlehub:latest
+    env_file: .env
+    command: ["celery", "-A", "app.workers.celery_app.celery_app", "worker", "-Q", "emails,stats,analysis", "--loglevel=INFO"]
+    depends_on:
+      - redis
+      - mongo
+    restart: unless-stopped
+
+  beat:
+    build: .
+    image: articlehub:latest
+    env_file: .env
+    command: ["celery", "-A", "app.workers.celery_app.celery_app", "beat", "--loglevel=INFO"]
+    depends_on:
+      - redis
+      - mongo
+    restart: unless-stopped
+
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    restart: unless-stopped
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+volumes:
+  mongo_data:
