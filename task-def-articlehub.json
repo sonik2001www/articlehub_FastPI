@@ -59,7 +59,7 @@
       "name": "worker",
       "image": "653999527800.dkr.ecr.us-east-1.amazonaws.com/articlehub-new:20251111-170108-arm64",
       "essential": true,
-      "command": ["celery", "-A", "app.workers.celery_app.celery_app", "worker", "-Q", "emails,stats,analysis", "--loglevel=INFO"],
+      "command": ["celery", "-A", "src.tasks.celery_app.celery_app", "worker", "-Q", "emails,stats,analysis", "--loglevel=INFO"],
       "environment": [
         { "name": "MONGO_URI", "value": "mongodb://127.0.0.1:27017" },
         { "name": "MONGO_DB", "value": "articlehub" },
@@ -94,7 +94,7 @@
       "name": "beat",
       "image": "653999527800.dkr.ecr.us-east-1.amazonaws.com/articlehub-new:20251111-170108-arm64",
       "essential": false,
-      "command": ["celery", "-A", "app.workers.celery_app.celery_app", "beat", "--loglevel=INFO"],
+      "command": ["celery", "-A", "src.tasks.celery_app.celery_app", "beat", "--loglevel=INFO"],
       "environment": [
         { "name": "MONGO_URI", "value": "mongodb://127.0.0.1:27017" },
         { "name": "MONGO_DB", "value": "articlehub" },
